@@ -29,7 +29,40 @@ def get_index() -> list[IndexedChunk]:
 def search(query: str, top_k: int = 5) -> list[tuple[Chunk, float]]:
     embedder = get_embedder()
     q_vec = embedder.encode(query)
-    index = get_index()
-    scored = [(ic.chunk, cosine(q_vec, ic.embedding)) for ic in index]
-    scored.sort(key=lambda pair: pair[1], reverse=True)
-    return scored[:top_k]
+
+    keywords = {
+        w.lower().strip(".,?!:;")
+        for w in query.split()
+        if len(w) > 2
+    }
+
+    scored = []
+
+    for ic in get_index():
+        semantic = cosine(q_vec, ic.embedding)
+
+        text = ic.chunk.text.lower()
+
+        lexical = 0.0
+        for word in keywords:
+            if word in text:
+                lexical += 0.04
+
+        final_score = semantic + lexical
+        scored.append((ic.chunk, final_score))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+
+    # Diversify by source
+    selected = []
+    seen_sources = set()
+
+    for chunk, score in scored:
+        if chunk.source_id not in seen_sources:
+            selected.append((chunk, score))
+            seen_sources.add(chunk.source_id)
+
+        if len(selected) >= top_k:
+            break
+
+    return selected

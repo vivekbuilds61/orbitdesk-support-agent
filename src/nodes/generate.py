@@ -36,9 +36,19 @@ Revise the answer so it fixes that problem, staying grounded only in the passage
 
 
 def _format_passages(retrieved: list[dict]) -> str:
+    """
+    Keep the prompt short enough for FLAN-T5.
+    """
     lines = []
-    for r in retrieved:
-        lines.append(f"[{r['source_id']}] {r['passage']}")
+
+    for r in retrieved[:3]:
+        passage = r["passage"].replace("\n", " ")
+
+        if len(passage) > 250:
+            passage = passage[:250] + "..."
+
+        lines.append(f"[{r['source_id']}] {passage}")
+
     return "\n\n".join(lines)
 
 
