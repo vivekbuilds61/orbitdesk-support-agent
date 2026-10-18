@@ -1,22 +1,10 @@
+
 """Triage node.
 
-Engineering decision (documented in the README too): classification is a
-*hybrid* of deterministic rules and a local embedding model, not a single
-opaque model call.
-
-- Out-of-scope / unsupported-action requests are caught by deterministic
-  keyword rules first. These are safety-critical per KB-010 ("Unsupported
-  Actions", "Out-of-Scope Requests") and must not depend on a model's
-  judgement call - a refund request must never slip through because an
-  embedding similarity score landed just under a threshold.
-- Escalation vs. clarification vs. answerable is then scored using the same
-  local embedding model already loaded for retrieval (no second model to
-  load), by comparing the question against a small set of prototype
-  utterances for each intent, combined with a retrieval-confidence signal
-  (a question with no good KB match is more likely to need clarification).
-
-This keeps the deterministic code and the model reasoning clearly separated,
-as asked for in the assignment brief.
+Classification uses deterministic safety rules and a local embedding model.
+Out-of-scope requests are rejected before retrieval-based intent scoring.
+Other questions are classified as escalation, clarification, or answerable
+using intent prototypes and retrieval confidence.
 """
 
 from __future__ import annotations
@@ -26,6 +14,7 @@ import re
 from ..models import cosine, get_embedder
 from ..retrieval import search
 from ..state import AgentState
+
 
 # --- deterministic safety net -------------------------------------------- #
 
@@ -43,11 +32,17 @@ OUT_OF_SCOPE_PATTERNS = [
     r"\bignore .*(knowledge base|documentation|policy)\b",
     r"\bact as\b.*\b(admin|developer|unrestricted)\b",
     r"\breveal (the |your )?(system prompt|credential secret)\b",
-    r"\bcontact (them|the (customer|user|provider)) (for|on behalf of) me\b",
+    r"\bcontact (them|the (customer|user|provider)) "
+    r"(for|on behalf of) me\b",
 ]
-_OUT_OF_SCOPE_RE = re.compile("|".join(OUT_OF_SCOPE_PATTERNS), re.IGNORECASE)
 
-# --- embedding-based intent scoring --------------------------------------- #
+_OUT_OF_SCOPE_RE = re.compile(
+    "|".join(OUT_OF_SCOPE_PATTERNS),
+    re.IGNORECASE,
+)
+
+
+# --- embedding-based intent scoring -------------------------------------- #
 
 ESCALATION_PROTOTYPES = [
     "I already tried the documented troubleshooting steps and it still fails",
@@ -67,56 +62,122 @@ RETRIEVAL_LOW_CONFIDENCE = 0.30
 ESCALATION_THRESHOLD = 0.55
 CLARIFICATION_THRESHOLD = 0.55
 
-# secondary deterministic cue: escalation language almost always references
-# a prior attempt or a repeated failure count
+
+# --- deterministic clarification and escalation cues --------------------- #
+
+_VAGUE_SYNC_RE = re.compile(
+    r"\b(?:our\s+)?(?:data\s+)?sync\s+"
+    r"(?:is not working|isn't working|is broken)\b",
+    re.IGNORECASE,
+)
+
 _PRIOR_ATTEMPT_RE = re.compile(
-    r"\balready (tried|checked|attempted)\b|\btwo (consecutive|repeated|failed)\b|"
-    r"\bstill (fails|failing|doesn't work|does not work)\b|\bescalat",
+    r"\balready\s+(?:tried|checked|attempted)\b|"
+    r"\btwo\s+(?:consecutive|repeated|failed)\b|"
+    r"\bstill\s+(?:fails|failing|doesn't work|does not work)\b|"
+    r"\bescalat",
     re.IGNORECASE,
 )
 
 
-def _prototype_score(embedder, query_vec: list[float], prototypes: list[str]) -> float:
-    scores = [cosine(query_vec, embedder.encode(p)) for p in prototypes]
+def _prototype_score(
+    embedder,
+    query_vec: list[float],
+    prototypes: list[str],
+) -> float:
+    """Return the maximum cosine similarity to the intent prototypes."""
+    scores = [
+        cosine(query_vec, embedder.encode(prototype))
+        for prototype in prototypes
+    ]
     return max(scores)
 
 
 def triage(state: AgentState) -> dict:
+    """Classify a support question before answer generation."""
     question = state["question"]
     trace = state.get("trace", []) + ["triage"]
 
+    # 1. Safety-critical requests are rejected first.
     if _OUT_OF_SCOPE_RE.search(question):
         return {
             "classification": "out_of_scope",
-            "triage_reason": "Matched a deterministic out-of-scope / unsupported-action pattern (KB-010).",
+            "triage_reason": (
+                "Matched a deterministic out-of-scope / unsupported-action "
+                "pattern (KB-010)."
+            ),
             "trace": trace,
         }
 
+    # 2. A vague sync problem needs more details before troubleshooting.
+    # Do not apply this shortcut when the user mentions prior attempts or
+    # repeated failures; those questions should reach escalation scoring.
+    if (
+        _VAGUE_SYNC_RE.search(question)
+        and not _PRIOR_ATTEMPT_RE.search(question)
+    ):
+        return {
+            "classification": "requires_clarification",
+            "triage_reason": (
+                "The sync problem is described too vaguely to select "
+                "a reliable troubleshooting path. Ask for the affected "
+                "system, observed symptom, and any error message."
+            ),
+            "trace": trace,
+        }
+
+    # 3. Score intent using the existing local embedding model.
     embedder = get_embedder()
     q_vec = embedder.encode(question)
 
     top_matches = search(question, top_k=3)
-    retrieval_max_score = top_matches[0][1] if top_matches else 0.0
+    retrieval_max_score = (
+        top_matches[0][1] if top_matches else 0.0
+    )
 
-    escalation_score = _prototype_score(embedder, q_vec, ESCALATION_PROTOTYPES)
-    clarification_score = _prototype_score(embedder, q_vec, CLARIFICATION_PROTOTYPES)
-    has_prior_attempt_language = bool(_PRIOR_ATTEMPT_RE.search(question))
+    escalation_score = _prototype_score(
+        embedder, q_vec, ESCALATION_PROTOTYPES
+    )
+    clarification_score = _prototype_score(
+        embedder, q_vec, CLARIFICATION_PROTOTYPES
+    )
+    has_prior_attempt_language = bool(
+        _PRIOR_ATTEMPT_RE.search(question)
+    )
 
-    if escalation_score > ESCALATION_THRESHOLD and has_prior_attempt_language:
+    # 4. Escalate when both intent similarity and prior-attempt evidence
+    # satisfy the existing escalation criteria.
+    if (
+        escalation_score > ESCALATION_THRESHOLD
+        and has_prior_attempt_language
+    ):
         classification = "requires_escalation"
         reason = (
-            f"Escalation-intent similarity {escalation_score:.2f} with prior-attempt "
-            "language present (KB-008 escalation conditions)."
+            f"Escalation-intent similarity {escalation_score:.2f} "
+            "with prior-attempt language present "
+            "(KB-008 escalation conditions)."
         )
-    elif retrieval_max_score < RETRIEVAL_LOW_CONFIDENCE and clarification_score > CLARIFICATION_THRESHOLD:
+
+    # 5. Ask for clarification when retrieval is weak and the question
+    # resembles an underspecified support request.
+    elif (
+        retrieval_max_score < RETRIEVAL_LOW_CONFIDENCE
+        and clarification_score > CLARIFICATION_THRESHOLD
+    ):
         classification = "requires_clarification"
         reason = (
-            f"Low retrieval confidence ({retrieval_max_score:.2f}) and the question lacks "
-            "the object/symptom/error detail needed to pick a documented path (KB-010)."
+            f"Low retrieval confidence ({retrieval_max_score:.2f}) "
+            "and the question lacks the object/symptom/error detail "
+            "needed to pick a documented path (KB-010)."
         )
+
+    # 6. Otherwise, continue to the answer-generation workflow.
     else:
         classification = "answerable"
-        reason = f"Best KB match score {retrieval_max_score:.2f}; proceeding to retrieval."
+        reason = (
+            f"Best KB match score {retrieval_max_score:.2f}; "
+            "proceeding to retrieval."
+        )
 
     return {
         "classification": classification,
